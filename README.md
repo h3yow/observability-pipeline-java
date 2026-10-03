@@ -144,7 +144,85 @@ EVICTED（从内存驱逐；若该序列已无任何窗口，释放其基数配�
 
 ---
 
-## 4. 基数与降级规则
+## 4. 通知控制层（静默 / 冷却 / 抖动）
+
+状态机如实反映指标状态，但"是否对外发通知"叠加了一层独立、可解释的控制：
+`NotificationController` 在每个（规则, 维度, 窗口）评估完成后，
+对状态机产出的通知类事件（`FIRED` / `RECOVERED`）做出**通知判定**，
+结果逐条落入通知台账（`NotificationRecord`），发出与抑制都留痕：
+
+| decision | 含义 |
+| --- | --- |
+| `NOTIFIED` | 正常对外通知 |
+| `SUPPRESSED_BY_SILENCE` | 命中静默/维护窗口，被抑制 |
+| `SUPPRESSED_BY_COOLDOWN` | 处于通知冷却期，被抑制 |
+| `SUPPRESSED_BY_FLAPPING` | 维度处于抖动降噪状态，被抑制 |
+
+每条记录还带有 `origin`（`INITIAL` 本轮首次 / `REPEAT` 冷却后再通知 /
+`FLAP_EXIT` 抖动退出结论）、`fireOccurrence`、`notifyRound` 与唯一
+`notificationId`——**冷却后的新一轮通知与同一轮里被抑制的重复项一眼可区分**。
+所有判定以**窗口起点**为时间基准，不依赖墙钟，同样的输入序列结论可复现。
+
+### 4.1 静默 / 维护窗口（Silence）
+
+- 对某条规则、或规则下被 `labelSelector` 选中的部分维度，划定 `[startMs, endMs)`；
+- 被评估窗口的起点落在区间内时，通知类事件被抑制并记录为
+  `SUPPRESSED_BY_SILENCE`；**状态机照常推进、结论不作假**；
+- 静默结束后不补发积压命中、也不凭空产生恢复：若届时仍在 FIRING，
+  只补一条 `REPEAT` 通知；静默期间发生的恢复只留一条被抑制的记录；
+- 设置结果明确可区分（不会默默生效或失效）：
+  `CREATED` / `INVALID_RANGE`（end≤start）/ `IN_PAST`（整体落在过去）/
+  `DUPLICATE`（同规则+同选择器+同区间）/ `OVERLAP`（同规则同选择器区间重叠）/
+  `LIMIT_REACHED`（达到 `max-silences` 上限）；
+- 过期静默随窗口推进自动回收；规则删除时其静默即刻回收。
+
+### 4.2 通知冷却与去重（Cooldown）
+
+- 某维度发出 `FIRED` 通知后进入 `notification-cooldown-ms` 冷却期，
+  期内同维度的再次触发通知被抑制（记录为 `SUPPRESSED_BY_COOLDOWN`）；
+- 冷却期满时若维度仍在 FIRING，补发一条 `origin=REPEAT`、`notifyRound`
+  递增的通知，与首次通知可区分；
+- `RECOVERED` 通知**不受冷却影响**，该出就出；
+- 冷却跟踪按维度活跃度老化：维度停止评估超过保留期后回收，
+  且条目至少存活一个完整冷却期。
+
+### 4.3 抖动识别（Flap Damping）
+
+- 每个维度在 `flap-window-ms` 观察窗口内，触发/恢复切换次数达到
+  `flap-transition-threshold`（默认 4，正常抖一两次不会误判）即进入
+  **降噪（damping）**：期间通知类事件被抑制并记录为 `SUPPRESSED_BY_FLAPPING`；
+- 降噪期间只观察稳定性：连续稳定满足、或连续稳定不满足达到
+  `flap-stable-windows` 个窗口后退出，并给出一条 `origin=FLAP_EXIT`
+  的一次性结论（方向与稳定结果一致：稳定满足→`FIRED`，稳定不满足→`RECOVERED`）；
+- 每个维度的抖动依据可查询（`GET /notifications/flapping`）：
+  观察窗内切换次数、两个方向的连续稳定计数、最近切换窗口，
+  与每次判定的输入一一对应。
+
+### 4.4 状态回收与上限
+
+| 状态 | 上限配置 | 回收时机 | 到达上限的行为 |
+| --- | --- | --- | --- |
+| 静默条目 | `max-silences`（128） | 过期随 tick 回收；规则删除即刻回收 | 新增返回 `LIMIT_REACHED`（HTTP 429） |
+| 抖动跟踪 | `max-notification-trackers`（2000） | 维度老化（保留期）随 tick 回收；规则删除即刻回收 | 淘汰最旧条目并累计 `flapTrackersEvicted` |
+| 冷却跟踪 | `max-notification-trackers`（2000） | 同上（按维度活跃度老化） | 淘汰最旧条目并累计 `cooldownTrackersEvicted` |
+
+淘汰计数在 `GET /api/v1/notifications/status` 可见——到达上限是可观测事件，
+不崩溃也不静默失效。所有跟踪状态只在评估锁内按窗口顺序变更，
+并发上报与后台推进同时发生时结论确定、可复现。
+
+### 4.5 与原有状态机的配合及兼容范围
+
+- 状态机（INACTIVE/PENDING/FIRING/RECOVERED）与生命周期事件
+  （`AlertEvent`）**完全不变**：通知控制层只读状态结论、不改写；
+  原有接口 `/alerts`、`/alerts/events` 语义不变，旧客户端不受影响；
+- 通知控制是**纯叠加层**：不配置静默、冷却设为 0、抖动阈值调大，
+  行为即退化为"状态机产出什么就通知什么"（`PENDING_STARTED` 本就不是通知）；
+- 通知台账（`/notifications`）与生命周期事件（`/alerts/events`）相互独立：
+  前者回答"该不该发、发了没有、为什么没发"，后者回答"状态机判出了什么"。
+
+---
+
+## 5. 基数与降级规则
 
 系统只在**配额内增长**，超限拒绝新序列，绝不无限膨胀：
 
@@ -166,7 +244,7 @@ EVICTED（从内存驱逐；若该序列已无任何窗口，释放其基数配�
 
 ---
 
-## 5. 本地存储与重放
+## 6. 本地存储与重放
 
 - 已受理样本在分配接收序号的同一临界区内以 JSONL 追加写入
   `${journal-dir}/samples.jsonl`（默认 `data/observability/samples.jsonl`）；
@@ -178,7 +256,7 @@ EVICTED（从内存驱逐；若该序列已无任何窗口，释放其基数配�
 
 ---
 
-## 6. HTTP 接口（/api/v1）
+## 7. HTTP 接口（/api/v1）
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -189,32 +267,42 @@ EVICTED（从内存驱逐；若该序列已无任何窗口，释放其基数配�
 | `GET /rules` / `DELETE /rules/{id}` | 列出 / 删除规则 |
 | `GET /alerts?ruleId=` | 规则维度状态快照（INACTIVE/PENDING/FIRING/RECOVERED） |
 | `GET /alerts/events?ruleId=` | 告警生命周期事件（含 occurrence 与判定依据） |
+| `PUT /silences` | 设置静默窗口；结果状态可区分（CREATED/INVALID_RANGE/IN_PAST/DUPLICATE/OVERLAP/LIMIT_REACHED） |
+| `GET /silences?ruleId=` / `DELETE /silences/{id}` | 查询 / 取消静默（取消结果 CANCELLED/NOT_FOUND） |
+| `GET /notifications?ruleId=` | 通知台账：每条通知判定的 kind/origin/decision/round 与依据 |
+| `GET /notifications/flapping` | 各维度抖动跟踪快照（切换计数、稳定计数、是否降噪） |
+| `GET /notifications/status` | 通知控制自观测：各类跟踪条目数与上限淘汰计数 |
 | `GET /pressure` | 压力与降级自观测快照 |
 | `POST /admin/tick` | 手动推进一个周期（封存→判定→驱逐） |
 
 ---
 
-## 7. 本地验证方法
+## 8. 本地验证方法
 
 环境要求：JDK 21+、Maven 3.9+。
 
-### 7.1 运行全部测试
+### 8.1 运行全部测试
 
 ```bash
 mvn test
 ```
 
-测试共 17 个（全部确定性，无随机等待依赖；测试时钟可手动推进、存储纯内存）：
+测试共 32 个（全部确定性，无随机等待依赖；测试时钟可手动推进、存储纯内存）：
 
 | 测试类 | 覆盖内容 |
 | --- | --- |
 | `IngestValidationTest` | 各类异常输入的可区分拒绝、服务端补时间戳 |
 | `WindowAggregationTest` | 乱序/顺序聚合一致、LAST 决胜、重复去重、迟到补入、封存冻结、可复现 |
 | `AlertStateTransitionTest` | PENDING 不误报、持续触发、FIRING 维度去重、恢复、恢复后再触发可区分、RECOVERED 回落 INACTIVE、多维度独立 |
+| `SilenceControlTest` | 静默期间状态照常推进但通知抑制、结束后只补一条 REPEAT、静默内恢复不重冒、维度级静默、设置结果全部分支（非法/过去/重复/重叠/上限/取消）、过期回收 |
+| `NotificationCooldownTest` | 持续触发冷却期满才补 REPEAT、冷却期内再触发被抑制、恢复不受冷却影响、相同输入序列重放结论一致 |
+| `FlapDetectionTest` | 4 次切换进入降噪、稳定满足/不满足退出并给出 FLAP_EXIT 结论、3 次切换不误判 |
+| `NotificationLifecycleTest` | 规则删除即刻回收、维度老化回收、跟踪上限淘汰最旧并计数 |
 | `DegradationTest` | 单指标/全局基数超限原因区分、已有序列不受影响、驱逐后配额恢复、令牌桶限流与恢复 |
 | `ConcurrentIngestTest` | 8 线程并发不同样本计数精确、SUM 确定；16 线程并发同一逻辑样本恰好计入一次 |
 | `JournalReplayTest` | 重启重放后聚合一致、基数恢复、接收序号续接 |
 | `ObservabilityApiTest` | HTTP 端到端：受理/拒绝、规则、封存、FIRING、基数降级、压力接口 |
+| `NotificationApiTest` | HTTP 端到端：静默设置各结果分支与 HTTP 状态码、查询/取消、通知台账与自观测接口 |
 
 **人工核对方式**：测试使用 SLF4J 日志逐条打印输入与判定依据，例如：
 
@@ -232,7 +320,7 @@ mvn test -Dtest=AlertStateTransitionTest
 cat target/surefire-reports/TEST-*AlertStateTransitionTest.xml | grep -o 'INGEST[^"]*'
 ```
 
-### 7.2 启动服务并手工验证
+### 8.2 启动服务并手工验证
 
 ```bash
 mvn spring-boot:run
@@ -249,9 +337,22 @@ curl -s -XPOST localhost:8080/api/v1/admin/tick
 curl -s 'localhost:8080/api/v1/alerts?ruleId=r1'
 curl -s localhost:8080/api/v1/alerts/events
 curl -s localhost:8080/api/v1/pressure
+
+# 通知控制：给 r1 划一个 10 分钟静默窗口（时间戳按当前毫秒调整）
+curl -s -XPUT localhost:8080/api/v1/silences -H 'Content-Type: application/json' \
+  -d '{"ruleId":"r1","labelSelector":{"host":"a"},"startMs":START,"endMs":END,
+       "reason":"nightly deploy"}'
+curl -s 'localhost:8080/api/v1/silences?ruleId=r1'
+# 推进后查看通知台账（发出/抑制及原因）、抖动快照与自观测计数
+curl -s -XPOST localhost:8080/api/v1/admin/tick
+curl -s 'localhost:8080/api/v1/notifications?ruleId=r1'
+curl -s localhost:8080/api/v1/notifications/flapping
+curl -s localhost:8080/api/v1/notifications/status
+# 取消静默（ID 来自设置或查询结果）
+curl -s -XDELETE localhost:8080/api/v1/silences/<id>
 ```
 
-### 7.3 主要配置（application.properties / 环境变量）
+### 8.3 主要配置（application.properties / 环境变量）
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -266,10 +367,16 @@ curl -s localhost:8080/api/v1/pressure
 | `observability.replay-on-startup` | true | 启动是否重放 |
 | `observability.journal-dir` | data/observability | 日志目录 |
 | `observability.tick-ms` | 1000 | 后台推进间隔 |
+| `observability.notification-cooldown-ms` | 120000 | FIRED 通知后的冷却期（0 表示关闭冷却） |
+| `observability.flap-window-ms` | 300000 | 抖动观察窗口 |
+| `observability.flap-transition-threshold` | 4 | 进入降噪所需的切换次数 |
+| `observability.flap-stable-windows` | 3 | 退出降噪所需的连续稳定窗口数 |
+| `observability.max-silences` | 128 | 静默条目上限 |
+| `observability.max-notification-trackers` | 2000 | 冷却/抖动跟踪条目上限 |
 
 ---
 
-## 8. 工程结构
+## 9. 工程结构
 
 ```
 model/        样本、受理结果、窗口聚合、规则、告警状态/事件、压力快照等类型
@@ -279,6 +386,7 @@ storage/      样本存储接口与本地 JSONL 实现（重放、序号分配�
 aggregate/    窗口聚合器（映射、封存、驱逐）
 ingest/       采集流水线（校验→限流→时间分类→基数→去重→落盘→聚合）
 alert/        规则注册、告警状态存储、四态状态机判定器
+notify/       通知控制层：静默存储、抖动跟踪、冷却与通知台账（叠加在状态机之上）
 engine/       推进器（封存→判定→驱逐）与 Spring 定时任务
 web/          HTTP 入口与请求体
 config/       参数与 Spring 装配

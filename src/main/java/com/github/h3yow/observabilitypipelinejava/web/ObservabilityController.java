@@ -10,7 +10,10 @@ import com.github.h3yow.observabilitypipelinejava.model.AggregateFunction;
 import com.github.h3yow.observabilitypipelinejava.model.AlertRule;
 import com.github.h3yow.observabilitypipelinejava.model.IngestResult;
 import com.github.h3yow.observabilitypipelinejava.model.MetricSample;
+import com.github.h3yow.observabilitypipelinejava.model.SilenceCreateStatus;
 import com.github.h3yow.observabilitypipelinejava.model.WindowState;
+import com.github.h3yow.observabilitypipelinejava.notify.NotificationController;
+import com.github.h3yow.observabilitypipelinejava.notify.SilenceStore;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -36,17 +39,20 @@ public class ObservabilityController {
     private final WindowAggregator aggregator;
     private final AlertRuleRegistry ruleRegistry;
     private final AlertStateStore alertStateStore;
+    private final NotificationController notificationController;
     private final PipelineEngine engine;
 
     public ObservabilityController(IngestService ingestService,
                                    WindowAggregator aggregator,
                                    AlertRuleRegistry ruleRegistry,
                                    AlertStateStore alertStateStore,
+                                   NotificationController notificationController,
                                    PipelineEngine engine) {
         this.ingestService = ingestService;
         this.aggregator = aggregator;
         this.ruleRegistry = ruleRegistry;
         this.alertStateStore = alertStateStore;
+        this.notificationController = notificationController;
         this.engine = engine;
     }
 
@@ -106,7 +112,70 @@ public class ObservabilityController {
     @DeleteMapping("/rules/{id}")
     public Map<String, Object> deleteRule(@PathVariable String id) {
         boolean removed = ruleRegistry.remove(id);
+        // 规则删除即刻回收其通知控制状态（静默/冷却/抖动跟踪）。
+        notificationController.onRuleDeleted(id);
         return Map.of("id", id, "removed", removed);
+    }
+
+    @PutMapping("/silences")
+    public Object putSilence(@RequestBody SilenceRequest request) {
+        if (request == null || request.ruleId() == null || request.ruleId().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "ruleId is required");
+        }
+        if (request.startMs() == null || request.endMs() == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "startMs and endMs are required");
+        }
+        SilenceStore.CreateResult result = notificationController.silenceStore().create(
+                request.ruleId(), request.labelSelector(), request.startMs(), request.endMs(),
+                request.reason(), System.currentTimeMillis());
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("status", result.status().name());
+        if (result.silence() != null) {
+            body.put("silence", result.silence());
+        }
+        // 各种异常情形以 HTTP 状态 + status 字段双重区分，不会默默生效或失效。
+        HttpStatus http = switch (result.status()) {
+            case CREATED -> HttpStatus.OK;
+            case INVALID_RANGE, IN_PAST -> HttpStatus.BAD_REQUEST;
+            case DUPLICATE, OVERLAP -> HttpStatus.CONFLICT;
+            case LIMIT_REACHED -> HttpStatus.TOO_MANY_REQUESTS;
+        };
+        return org.springframework.http.ResponseEntity.status(http).body(body);
+    }
+
+    @GetMapping("/silences")
+    public Object listSilences(@RequestParam(required = false) String ruleId) {
+        return notificationController.silenceStore().list(ruleId);
+    }
+
+    @DeleteMapping("/silences/{id}")
+    public Map<String, Object> cancelSilence(@PathVariable String id) {
+        boolean cancelled = notificationController.silenceStore().cancel(id);
+        return Map.of("id", id, "status", cancelled ? "CANCELLED" : "NOT_FOUND");
+    }
+
+    @GetMapping("/notifications")
+    public Object listNotifications(@RequestParam(required = false) String ruleId) {
+        return ruleId == null ? notificationController.allRecords()
+                : notificationController.records(ruleId);
+    }
+
+    @GetMapping("/notifications/flapping")
+    public Object flapping() {
+        return notificationController.flapping();
+    }
+
+    @GetMapping("/notifications/status")
+    public Object notificationStatus() {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("silences", notificationController.silenceStore().size());
+        body.put("flapTrackers", notificationController.flapTracker().size());
+        body.put("flapTrackersEvicted", notificationController.flapTracker().evictedCount());
+        body.put("cooldownTrackers", notificationController.cooldownSize());
+        body.put("cooldownTrackersEvicted", notificationController.cooldownEvictedCount());
+        body.put("notificationRecords", notificationController.allRecords().size());
+        return body;
     }
 
     @GetMapping("/alerts")

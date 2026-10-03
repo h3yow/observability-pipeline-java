@@ -11,6 +11,9 @@ import com.github.h3yow.observabilitypipelinejava.guard.RateLimiter;
 import com.github.h3yow.observabilitypipelinejava.ingest.IngestService;
 import com.github.h3yow.observabilitypipelinejava.model.IngestResult;
 import com.github.h3yow.observabilitypipelinejava.model.MetricSample;
+import com.github.h3yow.observabilitypipelinejava.notify.FlapTracker;
+import com.github.h3yow.observabilitypipelinejava.notify.NotificationController;
+import com.github.h3yow.observabilitypipelinejava.notify.SilenceStore;
 import com.github.h3yow.observabilitypipelinejava.storage.FileSampleStore;
 import com.github.h3yow.observabilitypipelinejava.time.Clock;
 import com.github.h3yow.observabilitypipelinejava.time.WindowTiming;
@@ -34,6 +37,9 @@ final class TestHarness {
     final IngestService ingest;
     final AlertRuleRegistry rules;
     final AlertStateStore alertStates;
+    final SilenceStore silences;
+    final FlapTracker flapTracker;
+    final NotificationController notifications;
     final AlertEvaluator evaluator;
     final PipelineEngine engine;
 
@@ -50,7 +56,14 @@ final class TestHarness {
                 cardinalityGuard, rateLimiter);
         this.rules = new AlertRuleRegistry();
         this.alertStates = new AlertStateStore();
-        this.evaluator = new AlertEvaluator(rules, alertStates);
+        this.silences = new SilenceStore(props.getMaxSilences());
+        this.flapTracker = new FlapTracker(props.getFlapWindowMs(),
+                props.getFlapTransitionThreshold(), props.getFlapStableWindows(),
+                props.getMaxNotificationTrackers());
+        this.notifications = new NotificationController(silences, flapTracker,
+                props.getNotificationCooldownMs(), props.getMaxNotificationTrackers());
+        this.evaluator = new AlertEvaluator(rules, alertStates, notifications,
+                props.getRetentionMs());
         this.engine = new PipelineEngine(aggregator, evaluator, cardinalityGuard, clock);
     }
 

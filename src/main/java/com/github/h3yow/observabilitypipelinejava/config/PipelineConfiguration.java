@@ -9,6 +9,9 @@ import com.github.h3yow.observabilitypipelinejava.engine.PipelineScheduler;
 import com.github.h3yow.observabilitypipelinejava.guard.CardinalityGuard;
 import com.github.h3yow.observabilitypipelinejava.guard.RateLimiter;
 import com.github.h3yow.observabilitypipelinejava.ingest.IngestService;
+import com.github.h3yow.observabilitypipelinejava.notify.FlapTracker;
+import com.github.h3yow.observabilitypipelinejava.notify.NotificationController;
+import com.github.h3yow.observabilitypipelinejava.notify.SilenceStore;
 import com.github.h3yow.observabilitypipelinejava.storage.FileSampleStore;
 import com.github.h3yow.observabilitypipelinejava.storage.SampleStore;
 import com.github.h3yow.observabilitypipelinejava.time.Clock;
@@ -84,8 +87,29 @@ public class PipelineConfiguration {
     }
 
     @Bean
-    public AlertEvaluator alertEvaluator(AlertRuleRegistry registry, AlertStateStore store) {
-        return new AlertEvaluator(registry, store);
+    public SilenceStore silenceStore(ObservabilityProperties p) {
+        return new SilenceStore(p.getMaxSilences());
+    }
+
+    @Bean
+    public FlapTracker flapTracker(ObservabilityProperties p) {
+        return new FlapTracker(p.getFlapWindowMs(), p.getFlapTransitionThreshold(),
+                p.getFlapStableWindows(), p.getMaxNotificationTrackers());
+    }
+
+    @Bean
+    public NotificationController notificationController(ObservabilityProperties p,
+                                                         SilenceStore silenceStore,
+                                                         FlapTracker flapTracker) {
+        return new NotificationController(silenceStore, flapTracker,
+                p.getNotificationCooldownMs(), p.getMaxNotificationTrackers());
+    }
+
+    @Bean
+    public AlertEvaluator alertEvaluator(AlertRuleRegistry registry, AlertStateStore store,
+                                         NotificationController notificationController,
+                                         ObservabilityProperties p) {
+        return new AlertEvaluator(registry, store, notificationController, p.getRetentionMs());
     }
 
     @Bean

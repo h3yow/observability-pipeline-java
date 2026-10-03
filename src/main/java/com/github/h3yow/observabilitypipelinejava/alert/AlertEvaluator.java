@@ -7,6 +7,7 @@ import com.github.h3yow.observabilitypipelinejava.model.AlertRule;
 import com.github.h3yow.observabilitypipelinejava.model.AlertState;
 import com.github.h3yow.observabilitypipelinejava.model.AlertStateSnapshot;
 import com.github.h3yow.observabilitypipelinejava.model.WindowAggregate;
+import com.github.h3yow.observabilitypipelinejava.notify.NotificationController;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -37,11 +38,18 @@ public class AlertEvaluator {
 
     private final AlertRuleRegistry ruleRegistry;
     private final AlertStateStore stateStore;
+    private final NotificationController notificationController;
+    /** 通知跟踪状态的老化阈值（与窗口保留期对齐）。 */
+    private final long trackerMaxAgeMs;
     private long eventSeq;
 
-    public AlertEvaluator(AlertRuleRegistry ruleRegistry, AlertStateStore stateStore) {
+    public AlertEvaluator(AlertRuleRegistry ruleRegistry, AlertStateStore stateStore,
+                          NotificationController notificationController,
+                          long trackerMaxAgeMs) {
         this.ruleRegistry = ruleRegistry;
         this.stateStore = stateStore;
+        this.notificationController = notificationController;
+        this.trackerMaxAgeMs = trackerMaxAgeMs;
     }
 
     /**
@@ -73,6 +81,8 @@ public class AlertEvaluator {
         for (AlertEvent e : generated) {
             stateStore.appendEvent(e);
         }
+        // 批次结束：回收过期静默与老化的冷却/抖动跟踪条目。
+        notificationController.prune(evaluatedAtMs, trackerMaxAgeMs);
         return generated;
     }
 
@@ -94,6 +104,9 @@ public class AlertEvaluator {
             return;
         }
 
+        // 本维度本窗口产生的生命周期事件（先收集，统一交给通知控制层判定）。
+        List<AlertEvent> dimensionEvents = new ArrayList<>();
+
         switch (state) {
             case INACTIVE -> {
                 if (matched) {
@@ -101,11 +114,11 @@ public class AlertEvaluator {
                     if (consecutive >= rule.fireAfterWindows()) {
                         state = AlertState.FIRING;
                         occurrence += 1;
-                        generated.add(event(AlertEventType.FIRED, rule, agg, observed,
+                        dimensionEvents.add(event(AlertEventType.FIRED, rule, agg, observed,
                                 occurrence, evaluatedAtMs));
                     } else {
                         state = AlertState.PENDING;
-                        generated.add(event(AlertEventType.PENDING_STARTED, rule, agg, observed,
+                        dimensionEvents.add(event(AlertEventType.PENDING_STARTED, rule, agg, observed,
                                 occurrence, evaluatedAtMs));
                     }
                 } else {
@@ -121,11 +134,11 @@ public class AlertEvaluator {
                     if (consecutive >= rule.fireAfterWindows()) {
                         state = AlertState.FIRING;
                         occurrence += 1;
-                        generated.add(event(AlertEventType.FIRED, rule, agg, observed,
+                        dimensionEvents.add(event(AlertEventType.FIRED, rule, agg, observed,
                                 occurrence, evaluatedAtMs));
                     } else {
                         state = AlertState.PENDING;
-                        generated.add(event(AlertEventType.PENDING_STARTED, rule, agg, observed,
+                        dimensionEvents.add(event(AlertEventType.PENDING_STARTED, rule, agg, observed,
                                 occurrence, evaluatedAtMs));
                     }
                 } else {
@@ -139,7 +152,7 @@ public class AlertEvaluator {
                     if (consecutive >= rule.fireAfterWindows()) {
                         state = AlertState.FIRING;
                         occurrence += 1;
-                        generated.add(event(AlertEventType.FIRED, rule, agg, observed,
+                        dimensionEvents.add(event(AlertEventType.FIRED, rule, agg, observed,
                                 occurrence, evaluatedAtMs));
                     }
                 } else {
@@ -156,14 +169,20 @@ public class AlertEvaluator {
                 } else {
                     consecutive = 0;
                     state = AlertState.RECOVERED;
-                    generated.add(event(AlertEventType.RECOVERED, rule, agg, observed,
+                    dimensionEvents.add(event(AlertEventType.RECOVERED, rule, agg, observed,
                             occurrence, evaluatedAtMs));
                 }
             }
         }
 
-        stateStore.put(new AlertStateSnapshot(rule.id(), agg.getFingerprint(), agg.getLabels(),
-                state, consecutive, observed, windowStart, occurrence, evaluatedAtMs));
+        AlertStateSnapshot current = new AlertStateSnapshot(rule.id(), agg.getFingerprint(),
+                agg.getLabels(), state, consecutive, observed, windowStart, occurrence,
+                evaluatedAtMs);
+        stateStore.put(current);
+        // 通知控制层：状态结论已落定，仅决定对外通知（静默/冷却/抖动）。
+        notificationController.onDimensionEvaluated(rule, agg, current, matched,
+                dimensionEvents, evaluatedAtMs);
+        generated.addAll(dimensionEvents);
     }
 
     private boolean matchesSelector(Map<String, String> labels, Map<String, String> selector) {
