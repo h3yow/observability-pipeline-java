@@ -9,6 +9,9 @@ import com.github.h3yow.observabilitypipelinejava.engine.PipelineScheduler;
 import com.github.h3yow.observabilitypipelinejava.guard.CardinalityGuard;
 import com.github.h3yow.observabilitypipelinejava.guard.RateLimiter;
 import com.github.h3yow.observabilitypipelinejava.ingest.IngestService;
+import com.github.h3yow.observabilitypipelinejava.notify.NotificationGate;
+import com.github.h3yow.observabilitypipelinejava.notify.NotificationStore;
+import com.github.h3yow.observabilitypipelinejava.notify.SilenceRegistry;
 import com.github.h3yow.observabilitypipelinejava.storage.FileSampleStore;
 import com.github.h3yow.observabilitypipelinejava.storage.SampleStore;
 import com.github.h3yow.observabilitypipelinejava.time.Clock;
@@ -89,9 +92,29 @@ public class PipelineConfiguration {
     }
 
     @Bean
+    public SilenceRegistry silenceRegistry(ObservabilityProperties p) {
+        return new SilenceRegistry(p.getNotificationMaxSilences());
+    }
+
+    @Bean
+    public NotificationStore notificationStore() {
+        return new NotificationStore();
+    }
+
+    @Bean
+    public NotificationGate notificationGate(SilenceRegistry silenceRegistry,
+                                             AlertRuleRegistry registry,
+                                             ObservabilityProperties p) {
+        return new NotificationGate(silenceRegistry, registry, p);
+    }
+
+    @Bean
     public PipelineEngine pipelineEngine(WindowAggregator aggregator, AlertEvaluator evaluator,
+                                         NotificationGate notificationGate,
+                                         NotificationStore notificationStore,
                                          CardinalityGuard cardinalityGuard, Clock clock) {
-        return new PipelineEngine(aggregator, evaluator, cardinalityGuard, clock);
+        return new PipelineEngine(aggregator, evaluator, notificationGate, notificationStore,
+                cardinalityGuard, clock);
     }
 
     @Bean

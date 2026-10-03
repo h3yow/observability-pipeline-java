@@ -18,6 +18,20 @@ public class ObservabilityProperties {
     private String journalDir = "data/observability";
     private boolean journalEnabled = true;
     private boolean replayOnStartup = true;
+    /** 触发通知冷却期（毫秒）；0 表示关闭冷却，行为与通知层引入前一致。 */
+    private long notificationCooldownMs = 0;
+    /** 抖动观察窗口（毫秒）；0 表示关闭抖动识别。 */
+    private long notificationFlapWindowMs = 0;
+    /** 观察窗口内状态转移达到该次数判定为抖动（>=2 才生效）。 */
+    private int notificationFlapTransitionThreshold = 6;
+    /** 降噪退出所需连续稳定满足/不满足的窗口数。 */
+    private int notificationFlapExitStableWindows = 3;
+    /** 静默窗口数量上限。 */
+    private int notificationMaxSilences = 256;
+    /** 通知跟踪器（规则×维度）数量上限。 */
+    private int notificationMaxTrackers = 10_000;
+    /** 通知跟踪器空闲回收时长（毫秒）。 */
+    private long notificationTrackerIdleMs = 3_600_000;
 
     public long getWindowSizeMs() { return windowSizeMs; }
     public void setWindowSizeMs(long v) { this.windowSizeMs = v; }
@@ -45,4 +59,18 @@ public class ObservabilityProperties {
     public void setJournalEnabled(boolean v) { this.journalEnabled = v; }
     public boolean isReplayOnStartup() { return replayOnStartup; }
     public void setReplayOnStartup(boolean v) { this.replayOnStartup = v; }
+    public long getNotificationCooldownMs() { return notificationCooldownMs; }
+    public void setNotificationCooldownMs(long v) { this.notificationCooldownMs = v; }
+    public long getNotificationFlapWindowMs() { return notificationFlapWindowMs; }
+    public void setNotificationFlapWindowMs(long v) { this.notificationFlapWindowMs = v; }
+    public int getNotificationFlapTransitionThreshold() { return notificationFlapTransitionThreshold; }
+    public void setNotificationFlapTransitionThreshold(int v) { this.notificationFlapTransitionThreshold = v; }
+    public int getNotificationFlapExitStableWindows() { return notificationFlapExitStableWindows; }
+    public void setNotificationFlapExitStableWindows(int v) { this.notificationFlapExitStableWindows = v; }
+    public int getNotificationMaxSilences() { return notificationMaxSilences; }
+    public void setNotificationMaxSilences(int v) { this.notificationMaxSilences = v; }
+    public int getNotificationMaxTrackers() { return notificationMaxTrackers; }
+    public void setNotificationMaxTrackers(int v) { this.notificationMaxTrackers = v; }
+    public long getNotificationTrackerIdleMs() { return notificationTrackerIdleMs; }
+    public void setNotificationTrackerIdleMs(long v) { this.notificationTrackerIdleMs = v; }
 }

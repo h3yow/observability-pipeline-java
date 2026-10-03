@@ -45,12 +45,13 @@ public class AlertEvaluator {
     }
 
     /**
-     * 按窗口起点升序评估一批已封存窗口，返回本次产生的事件
-     * （按窗口、规则、维度排序，顺序确定）。
+     * 按窗口起点升序评估一批已封存窗口，返回本次产生的事件与每次评估的输入快照
+     * （均按窗口、规则、维度排序，顺序确定）。评估快照供通知控制层复核判定依据。
      */
-    public synchronized List<AlertEvent> evaluate(List<WindowAggregate> sealedWindows,
+    public synchronized EvaluationResult evaluate(List<WindowAggregate> sealedWindows,
                                                   long evaluatedAtMs) {
         List<AlertEvent> generated = new ArrayList<>();
+        List<AlertEvaluation> evaluations = new ArrayList<>();
         List<WindowAggregate> ordered = new ArrayList<>(sealedWindows);
         ordered.sort(Comparator.comparingLong(WindowAggregate::getWindowStartMs)
                 .thenComparing(WindowAggregate::getSeriesKey));
@@ -63,7 +64,7 @@ public class AlertEvaluator {
                 if (!matchesSelector(agg.getLabels(), rule.labelSelector())) {
                     continue;
                 }
-                evaluateOne(rule, agg, generated, evaluatedAtMs);
+                evaluateOne(rule, agg, generated, evaluations, evaluatedAtMs);
             }
         }
         generated.sort(Comparator.comparingLong(AlertEvent::windowStartMs)
@@ -73,11 +74,11 @@ public class AlertEvaluator {
         for (AlertEvent e : generated) {
             stateStore.appendEvent(e);
         }
-        return generated;
+        return new EvaluationResult(generated, evaluations);
     }
 
     private void evaluateOne(AlertRule rule, WindowAggregate agg, List<AlertEvent> generated,
-                             long evaluatedAtMs) {
+                             List<AlertEvaluation> evaluations, long evaluatedAtMs) {
         String key = stateStore.keyOf(rule.id(), agg.getFingerprint());
         AlertStateSnapshot prev = stateStore.get(key);
         double observed = agg.valueOf(rule.function());
@@ -164,6 +165,8 @@ public class AlertEvaluator {
 
         stateStore.put(new AlertStateSnapshot(rule.id(), agg.getFingerprint(), agg.getLabels(),
                 state, consecutive, observed, windowStart, occurrence, evaluatedAtMs));
+        evaluations.add(new AlertEvaluation(rule.id(), agg.getFingerprint(), agg.getLabels(),
+                windowStart, matched, observed, state, occurrence, evaluatedAtMs));
     }
 
     private boolean matchesSelector(Map<String, String> labels, Map<String, String> selector) {

@@ -10,7 +10,13 @@ import com.github.h3yow.observabilitypipelinejava.model.AggregateFunction;
 import com.github.h3yow.observabilitypipelinejava.model.AlertRule;
 import com.github.h3yow.observabilitypipelinejava.model.IngestResult;
 import com.github.h3yow.observabilitypipelinejava.model.MetricSample;
+import com.github.h3yow.observabilitypipelinejava.model.SilenceOutcome;
+import com.github.h3yow.observabilitypipelinejava.model.SilenceWindow;
 import com.github.h3yow.observabilitypipelinejava.model.WindowState;
+import com.github.h3yow.observabilitypipelinejava.notify.NotificationGate;
+import com.github.h3yow.observabilitypipelinejava.notify.NotificationStore;
+import com.github.h3yow.observabilitypipelinejava.notify.SilenceRegistry;
+import com.github.h3yow.observabilitypipelinejava.time.Clock;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -37,17 +43,29 @@ public class ObservabilityController {
     private final AlertRuleRegistry ruleRegistry;
     private final AlertStateStore alertStateStore;
     private final PipelineEngine engine;
+    private final SilenceRegistry silenceRegistry;
+    private final NotificationGate notificationGate;
+    private final NotificationStore notificationStore;
+    private final Clock clock;
 
     public ObservabilityController(IngestService ingestService,
                                    WindowAggregator aggregator,
                                    AlertRuleRegistry ruleRegistry,
                                    AlertStateStore alertStateStore,
-                                   PipelineEngine engine) {
+                                   PipelineEngine engine,
+                                   SilenceRegistry silenceRegistry,
+                                   NotificationGate notificationGate,
+                                   NotificationStore notificationStore,
+                                   Clock clock) {
         this.ingestService = ingestService;
         this.aggregator = aggregator;
         this.ruleRegistry = ruleRegistry;
         this.alertStateStore = alertStateStore;
         this.engine = engine;
+        this.silenceRegistry = silenceRegistry;
+        this.notificationGate = notificationGate;
+        this.notificationStore = notificationStore;
+        this.clock = clock;
     }
 
     @PostMapping("/metrics/ingest")
@@ -106,7 +124,71 @@ public class ObservabilityController {
     @DeleteMapping("/rules/{id}")
     public Map<String, Object> deleteRule(@PathVariable String id) {
         boolean removed = ruleRegistry.remove(id);
-        return Map.of("id", id, "removed", removed);
+        // 规则删除后同步回收通知控制层状态，不留孤儿。
+        int purgedTrackers = notificationGate.purgeRule(id);
+        int purgedSilences = silenceRegistry.purgeRule(id);
+        return Map.of("id", id, "removed", removed,
+                "purgedTrackers", purgedTrackers, "purgedSilences", purgedSilences);
+    }
+
+    @PutMapping("/silences")
+    public Map<String, Object> putSilence(@RequestBody SilenceRequest request) {
+        if (request == null || request.ruleId() == null || request.ruleId().isBlank()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "ruleId is required");
+        }
+        if (request.startMs() == null || request.endMs() == null) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "startMs and endMs are required");
+        }
+        long now = clock.nowMillis();
+        java.util.Set<String> scope = request.fingerprints() == null
+                ? java.util.Set.of() : new java.util.TreeSet<>(request.fingerprints());
+        String id = request.id() == null || request.id().isBlank()
+                ? SilenceWindow.deriveId(request.ruleId(), scope, request.startMs(),
+                        request.endMs())
+                : request.id();
+        SilenceWindow window = new SilenceWindow(id, request.ruleId(), scope,
+                request.startMs(), request.endMs(),
+                request.reason() == null ? "" : request.reason(), now);
+        SilenceOutcome outcome = silenceRegistry.create(window, now);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("code", outcome.code().name());
+        body.put("ok", outcome.ok());
+        body.put("detail", outcome.detail());
+        if (outcome.silence() != null) {
+            body.put("silence", describe(outcome.silence(), now));
+        }
+        return body;
+    }
+
+    @GetMapping("/silences")
+    public List<Map<String, Object>> listSilences(@RequestParam(required = false) String ruleId) {
+        long now = clock.nowMillis();
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (SilenceWindow w : silenceRegistry.list(ruleId)) {
+            out.add(describe(w, now));
+        }
+        return out;
+    }
+
+    @DeleteMapping("/silences/{id}")
+    public Map<String, Object> cancelSilence(@PathVariable String id) {
+        SilenceOutcome outcome = silenceRegistry.cancel(id);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("code", outcome.code().name());
+        body.put("ok", outcome.ok());
+        body.put("detail", outcome.detail());
+        return body;
+    }
+
+    @GetMapping("/notifications")
+    public Object listNotifications(@RequestParam(required = false) String ruleId) {
+        return ruleId == null ? notificationStore.all() : notificationStore.list(ruleId);
+    }
+
+    @GetMapping("/notifications/trackers")
+    public Object listTrackers() {
+        return notificationGate.trackers();
     }
 
     @GetMapping("/alerts")
@@ -171,6 +253,19 @@ public class ObservabilityController {
                 throw new IllegalArgumentException("fireAfterWindows must be >= 1");
             }
         }
+    }
+
+    private Map<String, Object> describe(SilenceWindow w, long now) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", w.id());
+        m.put("ruleId", w.ruleId());
+        m.put("fingerprints", w.scopeList());
+        m.put("startMs", w.startMs());
+        m.put("endMs", w.endMs());
+        m.put("reason", w.reason());
+        m.put("createdAtMs", w.createdAtMs());
+        m.put("status", w.statusAt(now).name());
+        return m;
     }
 
     private Map<String, Object> describe(WindowAggregate agg) {

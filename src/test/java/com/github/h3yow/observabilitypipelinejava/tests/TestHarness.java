@@ -11,6 +11,9 @@ import com.github.h3yow.observabilitypipelinejava.guard.RateLimiter;
 import com.github.h3yow.observabilitypipelinejava.ingest.IngestService;
 import com.github.h3yow.observabilitypipelinejava.model.IngestResult;
 import com.github.h3yow.observabilitypipelinejava.model.MetricSample;
+import com.github.h3yow.observabilitypipelinejava.notify.NotificationGate;
+import com.github.h3yow.observabilitypipelinejava.notify.NotificationStore;
+import com.github.h3yow.observabilitypipelinejava.notify.SilenceRegistry;
 import com.github.h3yow.observabilitypipelinejava.storage.FileSampleStore;
 import com.github.h3yow.observabilitypipelinejava.time.Clock;
 import com.github.h3yow.observabilitypipelinejava.time.WindowTiming;
@@ -35,6 +38,9 @@ final class TestHarness {
     final AlertRuleRegistry rules;
     final AlertStateStore alertStates;
     final AlertEvaluator evaluator;
+    final SilenceRegistry silences;
+    final NotificationStore notifications;
+    final NotificationGate notificationGate;
     final PipelineEngine engine;
 
     TestHarness(ObservabilityProperties props, long startMs) {
@@ -51,7 +57,11 @@ final class TestHarness {
         this.rules = new AlertRuleRegistry();
         this.alertStates = new AlertStateStore();
         this.evaluator = new AlertEvaluator(rules, alertStates);
-        this.engine = new PipelineEngine(aggregator, evaluator, cardinalityGuard, clock);
+        this.silences = new SilenceRegistry(props.getNotificationMaxSilences());
+        this.notifications = new NotificationStore();
+        this.notificationGate = new NotificationGate(silences, rules, props);
+        this.engine = new PipelineEngine(aggregator, evaluator, notificationGate, notifications,
+                cardinalityGuard, clock);
     }
 
     static ObservabilityProperties defaultProps() {
@@ -102,10 +112,34 @@ final class TestHarness {
 
     PipelineEngine.TickResult tick() {
         PipelineEngine.TickResult r = engine.tick();
-        LOG.info("TICK at={} -> sealed={}, events={}, evictedWindows={}, deregisteredSeries={}",
-                r.atMs(), r.sealedWindows(), r.alertEvents(),
+        LOG.info("TICK at={} -> sealed={}, events={}, notifications={}, evictedWindows={}, deregisteredSeries={}",
+                r.atMs(), r.sealedWindows(), r.alertEvents(), r.notifications(),
                 r.evictedWindows(), r.deregisteredSeries());
         return r;
+    }
+
+    /**
+     * 驱动窗口 i：在其开放期上报该窗口样本，然后把时钟推进到该窗口可封存并 tick。
+     * 上报始终发生在“当前开放窗口”，避免自造迟到/封存竞态。
+     */
+    void driveWindow(String metric, Map<String, String> labels, int windowIndex, double value) {
+        long w = props.getWindowSizeMs();
+        long targetWindow = timing.windowStartFor(clock.nowMillis()) + windowIndex * w;
+        long desiredNow = targetWindow + 1_000;
+        if (desiredNow > clock.nowMillis()) {
+            clock.advance(desiredNow - clock.nowMillis());
+        }
+        send(metric, labels, targetWindow + 1_000, value, "probe");
+        long sealAt = targetWindow + w + props.getLatenessMs() + 1;
+        clock.advance(sealAt - clock.nowMillis());
+        tick();
+    }
+
+    /** 与生产代码一致的标签指纹。 */
+    static String fingerprint(Map<String, String> labels) {
+        return com.github.h3yow.observabilitypipelinejava.guard.SeriesIdentity.fingerprint(
+                com.github.h3yow.observabilitypipelinejava.guard.SeriesIdentity
+                        .normalize(labels));
     }
 
     static final class MutableClock implements Clock {
